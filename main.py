@@ -530,22 +530,38 @@ async def jealousy_check(message):
 # AUTO CHAT
 # =========================================================
 
+INACTIVITY_TIME = 36000  # 10 hours
+
+last_inactive_message = 0
+
 async def auto_chat():
 
     global current_mood
+    global last_inactive_message
 
     await client.wait_until_ready()
 
     while not client.is_closed():
 
-        await asyncio.sleep(random.randint(300, 600))
+        # check every 15 minutes instead
+        await asyncio.sleep(900)
 
         current_mood = random.choice(moods)
 
-        if time.time() - last_activity < 28800:
+        # no known channel
+        if not last_active_channel_id:
             continue
 
-        if not last_active_channel_id:
+        # how long inactive
+        inactive_for = time.time() - last_activity
+
+        # only trigger after 10h
+        if inactive_for < INACTIVITY_TIME:
+            continue
+
+        # prevent repeated dead server messages
+        # waits another 10h before sending again
+        if time.time() - last_inactive_message < INACTIVITY_TIME:
             continue
 
         channel = client.get_channel(last_active_channel_id)
@@ -556,16 +572,19 @@ async def auto_chat():
         try:
 
             await channel.send(random.choice([
-                "this server fell asleep again 💀",
-                "is anybody alive here",
-                "lowkey too quiet in here",
-                "i'm actually bored",
-                "someone say something 😭"
+                "this server died fr 💀",
+                "10 hours of silence is actually insane",
+                "did everybody evaporate 😭",
+                "lowkey thought discord crashed",
+                "hello???? anyone alive",
+                "this place abandoned asf"
             ]))
 
-        except:
-            pass
+            last_inactive_message = time.time()
 
+        except Exception as e:
+            print("auto chat error:", e)
+            
 # =========================================================
 # HANDLE MESSAGE
 # =========================================================
