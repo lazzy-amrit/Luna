@@ -2,7 +2,4 @@ discord.py
 python-dotenv
 openai
 httpx
-fastapi
-uvicorn
 aiosqlite
-pydantic
