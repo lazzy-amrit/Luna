@@ -35,19 +35,33 @@ client_ai = AsyncOpenAI(
     api_key=OPENROUTER_API_KEY
 )
 
+# OpenRouter likes apps to send these — helps with routing/support,
+# costs nothing to include.
+OR_EXTRA_HEADERS = {
+    "HTTP-Referer": "https://github.com/luna-discord-bot",
+    "X-Title": "Luna Discord Bot",
+}
+
 # =========================================================
 # MODELS
+# Verified working free-tier slugs as of Sept 2026.
+# Fast/small models first so replies feel snappy; bigger
+# reasoning models as fallback; openrouter/free (the official
+# auto-router) as a last resort that essentially never 404s.
+# Free models on OpenRouter rotate out with little notice, so
+# if you start seeing 404s again, check:
+# https://openrouter.ai/collections/free-models
 # =========================================================
 
 MODELS = [
-    "openai/gpt-oss-120b:free",
-    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3.5-lightning:free",      # small, fast, cheap latency
+    "z-ai/glm-5.2:free",
+    "minimax/minimax-m3:free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
-    "poolside/laguna-m.1:free",
-    "openai/gpt-oss-20b:free",
-    "nvidia/nemotron-3-nano-30b-a3b:free",
-    "liquid/lfm-2.5-1.2b-instruct:free",
+    "thinkingmachines/inkling-small:free",
+    "cohere/north-mini-code:free",
+    "openrouter/free",                          # auto-router, catch-all fallback
 ]
 
 # =========================================================
@@ -98,22 +112,11 @@ special_users = {
     }
 }
 
-# 30 minute window
 JEALOUSY_WINDOW = 1800
-
-# How many recent Luffy interactions become suspicious
 JEALOUSY_FLAG = 8
-
-# Maximum jealousy
 MAX_JEALOUSY = 12
-
-# 24 hours
 IGNORE_TIME = 86400
-
-# How often Luna can complain
 JEALOUSY_COOLDOWN = 120
-
-# How often jealousy naturally decreases
 JEALOUSY_DECAY_SECONDS = 600
 
 JEALOUS_LINES = [
@@ -289,7 +292,6 @@ async def load_jealousy_state():
             "ignored_until": float(row[5] or 0),
         })
 
-    # Make sure special users have a DB row
     for uid, data in special_users.items():
         await save_jealousy_state(uid)
 
@@ -767,12 +769,36 @@ async def ask_ai(prompt, uid, is_owner=False):
                 max_tokens=70,
                 presence_penalty=0.6,
                 frequency_penalty=0.7,
+                timeout=15,
+                extra_headers=OR_EXTRA_HEADERS,
             )
 
-            output = response.choices[0].message.content
+            # Defensive parsing — a rate-limited/misbehaving provider
+            # can hand back a response object with no choices at all,
+            # which is what caused the 'NoneType' object is not
+            # subscriptable crashes.
+            if not response or not getattr(response, "choices", None):
+                print(f"model empty response {model}: {response!r}")
+                continue
 
-            if output:
-                return output.strip()
+            choice = response.choices[0]
+            message_obj = getattr(choice, "message", None)
+
+            content = getattr(message_obj, "content", None) if message_obj else None
+
+            if content and content.strip():
+                return content.strip()
+
+            # Some reasoning models put text in a separate reasoning
+            # field and leave content empty/None — fall back to that
+            # rather than treating it as a hard failure.
+            reasoning = getattr(message_obj, "reasoning", None) if message_obj else None
+
+            if reasoning and reasoning.strip():
+                return reasoning.strip()
+
+            print(f"model returned no usable content {model}")
+            continue
 
         except Exception as e:
             print(f"model fail {model}: {e}")
@@ -787,14 +813,12 @@ async def ask_ai(prompt, uid, is_owner=False):
 
 async def is_talking_to_luffy(message):
 
-    # Direct mention of Luffy
     if any(
         str(user.id) == LUFFY_ID
         for user in message.mentions
     ):
         return True
 
-    # Direct reply to Luffy
     if message.reference:
 
         resolved = message.reference.resolved
@@ -803,8 +827,6 @@ async def is_talking_to_luffy(message):
             if str(resolved.author.id) == LUFFY_ID:
                 return True
 
-        # If Discord did not cache the referenced message,
-        # try fetching it.
         if resolved is None and message.reference.message_id:
 
             try:
@@ -829,42 +851,31 @@ async def jealousy_check(message):
 
     uid = str(message.author.id)
 
-    # Only monitor our special person
     if uid not in special_users:
         return
 
     data = special_users[uid]
     now = time.time()
 
-    # If Luna is already ignoring them,
-    # don't continue building jealousy.
     if now < data["ignored_until"]:
         return
 
-    # ONLY count interaction with Luffy
     talking_to_luffy = await is_talking_to_luffy(message)
 
     if not talking_to_luffy:
         return
 
-    # Remove old interactions
     data["recent_luffy"] = [
         timestamp
         for timestamp in data["recent_luffy"]
         if now - timestamp < JEALOUSY_WINDOW
     ]
 
-    # Lifetime counter
     data["luffy_count"] += 1
 
-    # Recent counter
     data["recent_luffy"].append(now)
 
     recent = len(data["recent_luffy"])
-
-    # =====================================================
-    # JEALOUSY GROWTH
-    # =====================================================
 
     if recent >= 3:
         data["jealousy_level"] += 1
@@ -897,18 +908,8 @@ async def jealousy_reaction(message):
     data = special_users[uid]
     now = time.time()
 
-    # =====================================================
-    # 24 HOUR IGNORE
-    # =====================================================
-
     if now < data["ignored_until"]:
-
-        # Silent ignore
         return True
-
-    # =====================================================
-    # ONLY REACT WHEN THEY TALK TO LUNA
-    # =====================================================
 
     is_luna_mentioned = client.user in message.mentions
 
@@ -918,13 +919,8 @@ async def jealousy_reaction(message):
         and message.reference.resolved.author == client.user
     )
 
-    # If not talking to Luna, don't react
     if not (is_luna_mentioned or is_reply_to_luna):
         return False
-
-    # =====================================================
-    # CURRENT RECENT ACTIVITY
-    # =====================================================
 
     data["recent_luffy"] = [
         timestamp
@@ -935,25 +931,15 @@ async def jealousy_reaction(message):
     recent = len(data["recent_luffy"])
     level = data["jealousy_level"]
 
-    # =====================================================
-    # NOTHING TO BE JEALOUS ABOUT
-    # =====================================================
-
     if recent < JEALOUSY_FLAG and level < 7:
         return False
 
-    # =====================================================
-    # NUCLEAR MODE
-    # =====================================================
-
     if level >= MAX_JEALOUSY:
 
-        # 35% chance to go nuclear
         if random.random() < 0.35:
 
             data["ignored_until"] = now + IGNORE_TIME
 
-            # Reset active jealousy
             data["jealousy_level"] = 0
             data["recent_luffy"].clear()
             data["last_trigger"] = now
@@ -966,14 +952,9 @@ async def jealousy_reaction(message):
 
             return True
 
-    # =====================================================
-    # NORMAL JEALOUSY
-    # =====================================================
-
     if now - data["last_trigger"] < JEALOUSY_COOLDOWN:
         return False
 
-    # More Luffy activity = higher chance
     chance = min(
         0.25 + (recent * 0.04),
         0.75
@@ -1008,18 +989,15 @@ async def jealousy_decay():
 
         for uid, data in special_users.items():
 
-            # Remove old recent activity
             data["recent_luffy"] = [
                 timestamp
                 for timestamp in data["recent_luffy"]
                 if now - timestamp < JEALOUSY_WINDOW
             ]
 
-            # Slowly cool down
             if data["jealousy_level"] > 0:
                 data["jealousy_level"] -= 1
 
-            # Save persistent state
             await save_jealousy_state(uid)
 
 
@@ -1092,7 +1070,6 @@ async def handle_message(message):
         ""
     ).strip()
 
-    # Also handle nickname-style mention
     clean = clean.replace(
         f"<@!{client.user.id}>",
         ""
@@ -1100,10 +1077,6 @@ async def handle_message(message):
 
     if not clean:
         clean = "yo"
-
-    # =====================================================
-    # CREATOR
-    # =====================================================
 
     if "who made you" in clean.lower():
 
@@ -1115,10 +1088,6 @@ async def handle_message(message):
 
         await message.reply(reply)
         return
-
-    # =====================================================
-    # LOCAL CREEP SHIELD
-    # =====================================================
 
     dodge = local_shield(clean, uid)
 
@@ -1138,10 +1107,6 @@ async def handle_message(message):
 
         await message.reply(dodge)
         return
-
-    # =====================================================
-    # AI RESPONSE
-    # =====================================================
 
     async with message.channel.typing():
 
@@ -1233,33 +1198,15 @@ async def on_message(message):
     global last_activity
     global last_active_channel_id
 
-    # Ignore bots
     if message.author.bot:
         return
 
-    # Track activity
     last_activity = time.time()
     last_active_channel_id = message.channel.id
 
     uid = str(message.author.id)
 
-    # =====================================================
-    # JEALOUSY OBSERVER
-    #
-    # This happens BEFORE checking whether Luna was mentioned.
-    #
-    # Therefore:
-    #
-    # special user -> Luffy = counted
-    # special user -> random person = ignored
-    # special user -> Luna = not counted
-    # =====================================================
-
     await jealousy_check(message)
-
-    # =====================================================
-    # IS THIS MESSAGE FOR LUNA?
-    # =====================================================
 
     is_luna_mentioned = client.user in message.mentions
 
@@ -1272,21 +1219,10 @@ async def on_message(message):
     if not (is_luna_mentioned or is_reply_to_luna):
         return
 
-    # =====================================================
-    # JEALOUSY REACTION
-    #
-    # If Luna is mad, she may react instead of answering
-    # normally.
-    # =====================================================
-
     ignored = await jealousy_reaction(message)
 
     if ignored:
         return
-
-    # =====================================================
-    # NORMAL COOLDOWN
-    # =====================================================
 
     now = time.time()
 
@@ -1297,10 +1233,6 @@ async def on_message(message):
         return
 
     cooldown[uid] = now
-
-    # =====================================================
-    # HANDLE AI IN BACKGROUND
-    # =====================================================
 
     asyncio.create_task(
         handle_message(message)
